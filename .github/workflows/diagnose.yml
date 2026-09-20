@@ -1,0 +1,80 @@
+name: Diagnose setup
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+      - name: Check Zotero, model, and send a setup test email
+        env:
+          ZOTERO_ID: ${{ secrets.ZOTERO_ID }}
+          ZOTERO_KEY: ${{ secrets.ZOTERO_KEY }}
+          SENDER: ${{ secrets.SENDER }}
+          RECEIVER: ${{ secrets.RECEIVER }}
+          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
+          CUSTOM_CONFIG: ${{ vars.CUSTOM_CONFIG }}
+        run: |
+          uv run python - <<'PY'
+          import os, sys, json, smtplib, ssl
+          from email.message import EmailMessage
+          from collections import Counter
+          from omegaconf import OmegaConf
+          from pyzotero import zotero
+          from openai import OpenAI
+          cfg = OmegaConf.merge(OmegaConf.load('config/base.yaml'), OmegaConf.create(os.environ['CUSTOM_CONFIG']))
+          failures = []
+          try:
+              z = zotero.Zotero(cfg.zotero.user_id, 'user', cfg.zotero.api_key)
+              items = z.everything(z.items())
+              counts = Counter(i['data']['itemType'] for i in items)
+              eligible = [i for i in items if i['data']['itemType'] in ('conferencePaper','journalArticle','preprint')]
+              usable = [i for i in eligible if i['data'].get('abstractNote', '').strip()]
+              print('ZOTERO_TOTAL_ITEMS=' + str(len(items)))
+              print('ZOTERO_ITEM_TYPES=' + json.dumps(counts))
+              print('ZOTERO_SUPPORTED_ITEMS=' + str(len(eligible)))
+              print('ZOTERO_SUPPORTED_WITH_ABSTRACT=' + str(len(usable)))
+              if not usable:
+                  failures.append('Zotero has no supported personal-library papers with abstracts')
+          except Exception as e:
+              print('ZOTERO_CHECK_FAILED=' + type(e).__name__)
+              failures.append('Zotero access failed')
+          try:
+              client = OpenAI(api_key=cfg.llm.api.key, base_url=cfg.llm.api.base_url, timeout=30, max_retries=0)
+              if cfg.llm.get('api_mode', 'chat_completion') == 'response':
+                  client.responses.create(model=cfg.llm.generation_kwargs.model, input='Reply OK only.', max_output_tokens=32)
+              else:
+                  client.chat.completions.create(model=cfg.llm.generation_kwargs.model, messages=[{'role':'user','content':'Reply OK only.'}], max_tokens=16)
+              print('MODEL_CHECK_OK')
+          except Exception as e:
+              print('MODEL_CHECK_FAILED=' + type(e).__name__ + '; HTTP=' + str(getattr(e, 'status_code', None)))
+              failures.append('Configured model request failed')
+          try:
+              msg = EmailMessage()
+              msg['Subject'] = 'Zotero arXiv Daily - setup test'
+              msg['From'] = cfg.email.sender
+              msg['To'] = cfg.email.receiver
+              msg.set_content('This is a setup test email. SMTP delivery has succeeded if you receive this message. Paper recommendations require supported papers with abstracts in your Zotero personal library.')
+              port = int(cfg.email.smtp_port)
+              if port == 465:
+                  server = smtplib.SMTP_SSL(cfg.email.smtp_server, port, timeout=20, context=ssl.create_default_context())
+              else:
+                  server = smtplib.SMTP(cfg.email.smtp_server, port, timeout=20)
+                  server.starttls(context=ssl.create_default_context())
+              with server:
+                  server.login(cfg.email.sender, cfg.email.sender_password)
+                  server.send_message(msg)
+              print('SETUP_TEST_EMAIL_SENT')
+          except Exception as e:
+              print('EMAIL_CHECK_FAILED=' + type(e).__name__ + '; SMTP=' + str(getattr(e, 'smtp_code', None)))
+              failures.append('Email delivery failed')
+          for failure in failures:
+              print('::error::' + failure)
+          sys.exit(1 if failures else 0)
+          PY
