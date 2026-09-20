@@ -1,6 +1,11 @@
 name: Diagnose setup
 on:
   workflow_dispatch:
+    inputs:
+      zotero_only:
+        description: Only check Zotero counts; skip model and email
+        type: boolean
+        default: true
 permissions:
   contents: read
 jobs:
@@ -12,6 +17,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - name: Check Zotero, model, and send a setup test email
         env:
+          ZOTERO_ONLY: ${{ inputs.zotero_only }}
           ZOTERO_ID: ${{ secrets.ZOTERO_ID }}
           ZOTERO_KEY: ${{ secrets.ZOTERO_KEY }}
           SENDER: ${{ secrets.SENDER }}
@@ -45,6 +51,10 @@ jobs:
           except Exception as e:
               print('ZOTERO_CHECK_FAILED=' + type(e).__name__)
               failures.append('Zotero access failed')
+          if os.environ.get('ZOTERO_ONLY') == 'true':
+              for failure in failures:
+                  print('::error::' + failure)
+              sys.exit(1 if failures else 0)
           try:
               client = OpenAI(api_key=cfg.llm.api.key, base_url=cfg.llm.api.base_url, timeout=30, max_retries=0)
               if cfg.llm.get('api_mode', 'chat_completion') == 'response':
